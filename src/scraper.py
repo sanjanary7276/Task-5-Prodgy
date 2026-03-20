@@ -6,18 +6,30 @@ import logging
 from fake_useragent import UserAgent
 from urllib.parse import urljoin, urlparse
 import re
+import os
+import hashlib
 from typing import List, Dict, Optional
 from tqdm import tqdm
 
 class EcommerceScraper:
-    def __init__(self, base_url: str, max_retries: int = 3, delay: float = 1.0):
+    def __init__(
+        self,
+        base_url: str,
+        max_retries: int = 3,
+        delay: float = 1.0,
+        cache_dir: Optional[str] = None,
+        cache_ttl_seconds: Optional[int] = 60 * 60,
+    ):
         self.base_url = base_url
         self.max_retries = max_retries
         self.delay = delay
         self.session = requests.Session()
         self.ua = UserAgent()
         self.session.headers.update({'User-Agent': self.ua.random})
-        self.products = []
+        self.cache_dir = cache_dir
+        self.cache_ttl_seconds = cache_ttl_seconds
+        if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
         
         # Setup logging
         logging.basicConfig(
@@ -30,7 +42,53 @@ class EcommerceScraper:
         )
         self.logger = logging.getLogger(__name__)
 
+    def _cache_path_for_url(self, url: str) -> Optional[str]:
+        if not self.cache_dir:
+            return None
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return os.path.join(self.cache_dir, f"{digest}.html")
+
+    def _is_cache_fresh(self, path: str) -> bool:
+        if self.cache_ttl_seconds is None:
+            return True
+        try:
+            mtime = os.path.getmtime(path)
+            return (time.time() - mtime) <= self.cache_ttl_seconds
+        except OSError:
+            return False
+
+    def _load_soup_from_cache(self, url: str) -> Optional[BeautifulSoup]:
+        cache_path = self._cache_path_for_url(url)
+        if not cache_path:
+            return None
+        if not os.path.exists(cache_path) or not self._is_cache_fresh(cache_path):
+            return None
+
+        try:
+            with open(cache_path, "rb") as f:
+                content = f.read()
+            self.logger.info(f"Cache hit for {url}")
+            return BeautifulSoup(content, "html.parser")
+        except Exception as e:
+            self.logger.warning(f"Failed reading cache for {url}: {e}")
+            return None
+
+    def _save_response_to_cache(self, url: str, content: bytes) -> None:
+        cache_path = self._cache_path_for_url(url)
+        if not cache_path:
+            return
+        try:
+            with open(cache_path, "wb") as f:
+                f.write(content)
+        except Exception as e:
+            self.logger.warning(f"Failed writing cache for {url}: {e}")
+
     def make_request(self, url: str) -> Optional[BeautifulSoup]:
+        # Optional: serve HTML from cache to reduce network calls.
+        cached_soup = self._load_soup_from_cache(url)
+        if cached_soup is not None:
+            return cached_soup
+
         for attempt in range(self.max_retries):
             try:
                 self.logger.info(f"Requesting: {url} (Attempt {attempt + 1})")
@@ -39,6 +97,7 @@ class EcommerceScraper:
                 
                 soup = BeautifulSoup(response.content, 'html.parser')
                 self.logger.info(f"Successfully fetched: {url}")
+                self._save_response_to_cache(url, response.content)
                 return soup
                 
             except requests.RequestException as e:
@@ -48,6 +107,40 @@ class EcommerceScraper:
                 else:
                     self.logger.error(f"Max retries reached for {url}")
                     return None
+
+    def _normalize_price(self, price: str) -> str:
+        price = (price or "").strip()
+        if not price:
+            return ""
+        # Normalize common decimal separators and strip everything except digits and dots.
+        price = price.replace(",", ".")
+        price = re.sub(r"[^0-9.]+", "", price)
+        return price
+
+    def _normalize_rating(self, rating: str) -> str:
+        rating = (rating or "").strip()
+        if not rating:
+            return ""
+        match = re.search(r"(\d+)", rating)
+        return match.group(1) if match else ""
+
+    def _is_valid_product(self, product: Dict[str, str]) -> bool:
+        # Keep rating optional, but name/price/link are needed for meaningful exports.
+        return bool(product.get("name")) and bool(product.get("price")) and bool(product.get("link"))
+
+    def _normalize_product_record(self, product: Dict[str, str], base_url: str) -> Dict[str, str]:
+        product = {**product}
+        product["name"] = (product.get("name") or "").strip()
+        product["price"] = self._normalize_price(product.get("price") or "")
+        product["rating"] = self._normalize_rating(product.get("rating") or "")
+
+        link = (product.get("link") or "").strip()
+        if link and not link.startswith("http"):
+            product["link"] = urljoin(base_url, link)
+        else:
+            product["link"] = link
+
+        return product
 
     def extract_product_info(self, product_element, base_url: str) -> Dict[str, str]:
         product = {
@@ -155,26 +248,30 @@ class EcommerceScraper:
         soup = self.make_request(url)
         if not soup:
             return []
-        
-        products = []
-        
+
+        return self._parse_products_from_soup(soup=soup, page_url=url)
+
+    def _parse_products_from_soup(self, soup: BeautifulSoup, page_url: str) -> List[Dict[str, str]]:
+        products: List[Dict[str, str]] = []
+
         # Special handling for books.toscrape.com
-        if 'books.toscrape.com' in url:
+        if 'books.toscrape.com' in page_url:
             product_elements = soup.select('article.product_pod')
             if product_elements:
                 self.logger.info(f"Found {len(product_elements)} books using books.toscrape.com selector")
                 for element in product_elements:
                     product = self.extract_books_to_scrape_info(element, self.base_url)
-                    if product['name']:
+                    product = self._normalize_product_record(product, self.base_url)
+                    if self._is_valid_product(product):
                         products.append(product)
-                return products
-        
+            return products
+
         # Common product container selectors for other sites
         product_selectors = [
-            '.product', '.product-item', '.item', '.book', 
+            '.product', '.product-item', '.item', '.book',
             '[data-product]', '.product-card', '.listing-item'
         ]
-        
+
         product_elements = []
         for selector in product_selectors:
             elements = soup.select(selector)
@@ -182,16 +279,17 @@ class EcommerceScraper:
                 product_elements = elements
                 self.logger.info(f"Found {len(elements)} products using selector: {selector}")
                 break
-        
+
         if not product_elements:
             self.logger.warning("No products found on the page")
             return []
-        
+
         for element in product_elements:
             product = self.extract_product_info(element, self.base_url)
-            if product['name']:  # Only add if we have at least a name
+            product = self._normalize_product_record(product, self.base_url)
+            if self._is_valid_product(product):
                 products.append(product)
-        
+
         return products
 
     def find_next_page(self, soup, current_url: str) -> Optional[str]:
@@ -220,33 +318,33 @@ class EcommerceScraper:
 
     def scrape_all_pages(self, max_pages: int = 10) -> List[Dict[str, str]]:
         current_url = self.base_url
-        page_count = 0
         all_products = []
         
+        pages_scraped = 0
         with tqdm(desc="Scraping pages", unit="page") as pbar:
-            while current_url and page_count < max_pages:
-                self.logger.info(f"Scraping page {page_count + 1}: {current_url}")
+            while current_url and pages_scraped < max_pages:
+                self.logger.info(f"Scraping page {pages_scraped + 1}: {current_url}")
                 
-                products = self.scrape_page(current_url)
+                soup = self.make_request(current_url)
+                if not soup:
+                    self.logger.error("Failed to fetch page for scraping")
+                    break
+
+                products = self._parse_products_from_soup(soup=soup, page_url=current_url)
                 all_products.extend(products)
                 
                 # Update progress bar with product count
                 pbar.set_description(f"Scraping pages (Products: {len(all_products)})")
                 pbar.update(1)
+                pages_scraped += 1
                 
                 # Find next page
-                soup = self.make_request(current_url)
-                if soup:
-                    next_url = self.find_next_page(soup, current_url)
-                    if next_url and next_url != current_url:
-                        current_url = next_url
-                        page_count += 1
-                        time.sleep(self.delay)  # Be respectful to the server
-                    else:
-                        self.logger.info("No more pages found")
-                        break
+                next_url = self.find_next_page(soup, current_url)
+                if next_url and next_url != current_url:
+                    current_url = next_url
+                    time.sleep(self.delay)  # Be respectful to the server
                 else:
-                    self.logger.error("Failed to fetch page for pagination")
+                    self.logger.info("No more pages found")
                     break
         
         self.logger.info(f"Total products scraped: {len(all_products)}")
